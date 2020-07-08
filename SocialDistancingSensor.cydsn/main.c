@@ -14,131 +14,133 @@
 #include "main.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <time.h>
 
 #define LIGHT_OFF                       (0u)
 #define LIGHT_ON                        (1u)
 #define DEFAULT_PRIORITY                    (3u)
 
-static volatile uint8_t inter = 0;
+static volatile uint8_t interruptFlag = 0;
 CY_ISR_PROTO(ISR);
 CY_ISR(ISR){
     IRQ_ClearPending();    /* Clear pending Interrupt */
     pin_1_ClearInterrupt();    /* Clear pin Interrupt */
-	inter = 1;
+	interruptFlag = 1;
 }
-enum ROLE_e {
-    RECEIVER,
-    TRANSMITTER,
-    ANCHOR,
-    TAG,
-    NOT_DEFINED
-};
 
 enum STATE_e {
     STATE_INIT,
-    /* Tag */
-    STATE_TAG_WAIT_FIRST_SEND,
-    STATE_TAG_WAIT_RESPONSE,	
-    STATE_TAG_SECOND_SEND,
-    STATE_TAG_WAIT_SECOND_SEND,
-    STATE_TAG_GET_TIMES,
-    STATE_TAG_PROCESS_DISTANCE,
-    STATE_TAG_END,
-    /* Anchor */
-    STATE_ANCHOR_LISTENING,
-    STATE_ANCHOR_SEND_ANSWER,
-    STATE_ANCHOR_WAIT_ANSWER_COMPLETION,
-    STATE_ANCHOR_WAIT_FINAL,
-    STATE_ANCHOR_SEND_TIMES,
-    STATE_ANCHOR_END,
+    
+    /* Social */
+    STATE_INITIATE_CONTACT,
+    STATE_INITIATE_CONTACT_PENDING,
+    STATE_PREPARE_TO_LISTEN,
+    STATE_LISTENING,
+    STATE_SEND_FINAL,
+    STATE_SEND_FINAL_PENDING,
+    STATE_WAIT_FOR_RESULTS, // DEL
+    STATE_PROCESS_RESULTS,
+    STATE_SEND_DISTANCE,
+    STATE_SEND_DISTANCE_PENDING,
+
+    STATE_WAIT_RANDOM,
+    STATE_ANSWER,
+    STATE_ANSWER_PENDING,
+    STATE_WAIT_FOR_FINAL,
+    STATE_SEND_RESULTS,
+    STATE_SEND_RESULTS_PENDING,
+    STATE_WAIT_FOR_DISTANCE,
 };
 
+enum Message_ID_e {
+    INITIAL_MSG = 0x10,
+    ANSWER_MSG = 0x11,
+    FINAL_MSG = 0x12,
+    RESULTS_MSG = 0x13,
+    DISTANCE_MSG = 0x14,
+};
+
+struct Message_s{
+    uint8_t id;
+    uint8_t from;
+    uint8_t to;
+    int data;
+};
+struct Message_s msg2;
+uint8_t deviceID = 0;
+uint8_t remoteDeviceID;
+
+
 enum STATE_e state = STATE_INIT;
-enum ROLE_e role = NOT_DEFINED;
 
-static uint8_t RxData[15];
+#define DATA_LEN (15u)
+static uint8_t RxData[DATA_LEN];
 static uint8_t TxData[128];
-
-uint8_t SW1_cur = 0;
-uint8_t SW2_cur = 0;
-uint8_t SW3_cur = 0;
-uint8_t SW4_cur = 0;
-uint8_t SW1_prev = 0;
-uint8_t SW2_prev = 0;
-uint8_t SW3_prev = 0;
-uint8_t SW4_prev = 0;
 
 uint8_t RxOk = 0u;
 uint8_t TxOk = 0u;
 uint8_t RxError = 0u;
+uint8_t cycleTimeoutFlag = 0u;
+uint16_t cycleTimeout = 0u;
+uint16_t messageTimeout = 0u;
+uint16_t responseTime = 0u;
 
-static uint64_t t1, t2, t3, t4, t5, t6;
-static uint8_t t1_8[5];
-static uint8_t t2_8[5];
-static uint8_t t3_8[5];
-static uint8_t t4_8[5];
-static uint8_t t5_8[5];
-static uint8_t t6_8[5];
+uint8_t alertOn = 0u;
+uint16 alertTimer = 0u;
+#define ALERT_PERIOD (1000u)
 
-/*
-static volatile uint64_t TroundMaster;
-static volatile uint64_t TreplySlave;
-static volatile uint64_t TroundSlave;
-static volatile uint64_t TreplyMaster;
-*/
+#define CYCLE_PERIOD (200u)
+#define MESSAGE_TIMEOUT (5u)
 
-double TroundMaster;
-double TreplySlave;
-double TroundSlave;
-double TreplyMaster;
+#define SAFE_DISTANCE_CM (100u)
 
-double timeOfFly_tick;
-//double tick2s;
-double distance;
-double tof_num;
-double tof_denum;
-
-#define MEAN_LEN (8u)
-double distLog[MEAN_LEN];
-uint8_t distIdx = 0;
-double mean = 0.0;
-
-uint8_t succesRate = 0;
-uint8_t successCntr = 0;
-#define SUCCESS_LEN (20u)
-float successPercent = 0.0f;
-
-#define TICK2S (1.0f / (128 * 499.2f * 10e6)) * 10 // Unknown factor 10 
-//#define TICK2S (1.0f / (72499865600.0f))
-//#define TICK2S (1.0f / (125e6))
+#define TICK2S ((1.0f / (128 * 499.2f * 10e6)) * 10.0f) // Unknown factor 10 
 #define LIGHT_SPEED (299792458.0f) // m/s
 
 void interrupt_routine(void);
-void rxLoop(void);
-void txLoop(void);
-void anchorLoop(void);
-void tagLoop(void);
 
+void socialDistancindLoop(void);
+void setRandomSeed(void);
 
-CY_ISR( isr_timer_Handler ){
+struct Message_s readRxData(void);
+void sendTxData(struct Message_s, uint16_t);
+
+CY_ISR( isr_timeout_Handler ){
     /* Clear the inteerrupt */
     Timer_ReadStatusRegister();
-    state = STATE_INIT;
-    LED1_Write(~LED1_Read());
-    successCntr++;
-    if (successCntr >= SUCCESS_LEN)
-    {
-        successCntr = 0;
-        successPercent = (SUCCESS_LEN - succesRate) * 100.0f / SUCCESS_LEN;
-        succesRate = 0;
+    
+    if (cycleTimeout == 0u){
+        cycleTimeoutFlag = 1u;
+        cycleTimeout = CYCLE_PERIOD;
+    }else{
+        cycleTimeout--;
     }
-    succesRate++;
+    
+    if (alertOn){
+        alertOn = 0;
+        LED1_Write(LIGHT_ON);
+        LED2_Write(LIGHT_ON);
+        LED3_Write(LIGHT_ON);
+        LED4_Write(LIGHT_ON);
+        alertTimer = ALERT_PERIOD;
+    }
+    
+    if (alertTimer == 1u){
+        LED1_Write(LIGHT_OFF);
+        LED2_Write(LIGHT_OFF);
+        LED3_Write(LIGHT_OFF);
+        LED4_Write(LIGHT_OFF);
+    }
+    
+    messageTimeout = messageTimeout > 1u ? messageTimeout-1u : 0u;
+    responseTime = responseTime > 1u ? responseTime-1u : 0u;
+    alertTimer = alertTimer > 1u ? alertTimer-1u : 0u;
 }
 
 int main(void)
 {
     CyGlobalIntEnable; /* Enable global interrupts. */
-    
 
 	LED1_Write(LIGHT_OFF);
     LED2_Write(LIGHT_OFF);
@@ -148,7 +150,6 @@ int main(void)
     SPIM_Start();
     LCD_Start();    
 
-    
     /* Sets up the GPIO interrupt and enables it */
     IRQ_StartEx(ISR);
     IRQ_SetPriority(DEFAULT_PRIORITY);
@@ -164,32 +165,18 @@ int main(void)
     LCD_ClearDisplay();
     LCD_Position(0u,0u);
     LCD_PrintString("Init..Ok");
-
-    isr_timer_StartEx(isr_timer_Handler);
+  
     Timer_Start();
+    isr_timeout_StartEx(isr_timeout_Handler);
     
-    
-    if (Pot_Read())
-    {
-        role = ANCHOR;       
-    }else
-    {
-        role = TAG;
-    }
-    
-    /*
-    while(role == NOT_DEFINED){
-        if(SW1_Read()){ role = RECEIVER; }
-        if(SW2_Read()){ role = TAG; }
-        if(SW3_Read()){ role = ANCHOR; }
-        if(SW4_Read()){ role = TRANSMITTER; }
-    }
-    */
-    
-    if (role == TRANSMITTER){ txLoop(); }
-    else if(role == RECEIVER){ rxLoop(); }
-    else if(role == ANCHOR){ anchorLoop(); }
-    else if(role == TAG){ tagLoop(); }
+    setRandomSeed();
+    socialDistancindLoop();
+}
+
+void setRandomSeed(){
+    int16 temp;
+    DieTemp_GetTemp(&temp);
+    srand( temp );
 }
 
 void interrupt_routine(void){
@@ -226,382 +213,356 @@ void interrupt_routine(void){
 	}
 	// clear IRQ flags on DW
 	DWM_WriteSPI_ext(SYS_STATUS, NO_SUB, ack, 4);
-    inter=0;
+    interruptFlag = 0;
 }
 
-void rxLoop(){
-    LCD_Position(0u, 0u);
-    LCD_PrintString(" Rx     ");
-
-    idle();
-    DWM_Enable_Rx();
+struct Message_s readRxData(){
+    struct Message_s msg;
     
-    for(;;){
-        if (inter){
-            LED1_Write(~LED1_Read());
-            interrupt_routine();
-        }
-        if (RxOk){
-            RxOk = 0;
-            LED2_Write(~LED2_Read());
-			DWM_ReceiveData(RxData); 	// Read Rx buffer
-            LCD_Position(0u,3u);
-            LCD_PrintHexUint8(RxData[0]);
-			
-            DWM_ReadSPI_ext(RX_TIME,NO_SUB, t1_8, 5);// get T4
-			for (int i=0;i<5;i++){
-				t1 = (t1 << 8) | t1_8[4-i];
-			}
-            
-            LCD_Position(1u,0u);
-            LCD_PrintInt32(t1);
-
-            DWM_Enable_Rx();
-
-        }
-        if (RxError)
-        {
-            RxError = 0u;
-            LED3_Write(~LED3_Read());
-            DWM_Reset_Rx();
-            DWM_Enable_Rx();
-        }
-    }
+    /* RxData is shifted by 1 byte and byte 0 is duplicated so message starts
+       at byte 1. */
+    DWM_ReceiveData(RxData);
+    memcpy(&msg, &RxData[1], sizeof(msg2));
+    
+    return msg;
 }
 
-void txLoop(){
-
-    LCD_Position(0u, 0u);
-    LCD_PrintString(" Tx     ");
-    uint8_t cntr = 0u;
-    
-    for(;;){
-        SW3_prev = SW3_cur;
-        SW3_cur = SW3_Read();
-
-        if (SW3_cur && !(SW3_prev))
-        {
-            cntr ++;
-            CyDelay(50u);
-            LCD_Position(1u, 0u);
-            LCD_PrintString("sent    ");
-            LCD_Position(1u, 6u);
-            LCD_PrintNumber(cntr);
-            LED1_Write(~LED1_Read());
-
-            idle();
-            
-            TxData[0] = 0xFA;
-            DWM_SendData(TxData,1,1);
-            CyDelay(100u);
-        }
-        if (inter)
-        {
-            interrupt_routine();
-        }
-        if (TxOk)
-        {
-            TxOk = 0u;
-            LED4_Write(~LED4_Read());
-        }
-    }
+void sendTxData(struct Message_s msg, uint16_t timeout){
+    memcpy(&TxData, &msg, sizeof(msg));
+    DWM_SendData(TxData, sizeof(msg), 1);
+    messageTimeout = timeout;
 }
 
-void anchorLoop(){
-    LCD_Position(0u, 0u);
-    LCD_PrintString("anchor  ");
+void socialDistancindLoop(){
     
-    
+    /* Asymmetric Double-Sided Two-Way Ranging */
+    uint64_t t1 = 0u, t2 = 0u, t3 = 0u, t4 = 0u, t5 = 0u, t6 = 0u;
+    uint8_t t1_8[5], t2_8[5], t3_8[5], t4_8[5], t5_8[5], t6_8[5];
 
+    double TroundMaster;
+    double TreplySlave;
+    double TroundSlave;
+    double TreplyMaster;
+    double tof_num;
+    double tof_denum;
+    double tof_tick;
+    double distance;
     
-    for(;;){
+    state = STATE_INITIATE_CONTACT;
+    deviceID = rand() & 0xFF;
+
+    for (;;){
         switch(state){
-            case STATE_INIT:
+            case STATE_INITIATE_CONTACT :
+                idle();                
+                sendTxData((struct Message_s) {
+                    .id = INITIAL_MSG,
+                    .from = deviceID,
+                    .to = deviceID,
+                }, 105); // @TODO timeout
+                
+                state = STATE_INITIATE_CONTACT_PENDING;
+                break;
+            
+            case STATE_INITIATE_CONTACT_PENDING:
+                if (messageTimeout == 0u){ state = STATE_PREPARE_TO_LISTEN; }  
+                if (interruptFlag){ interrupt_routine(); }
+                if (TxOk){
+                    TxOk = 0;
+                    DWM_ReadSPI_ext(TX_TIME, NO_SUB, t1_8, 5);
+                    state = STATE_PREPARE_TO_LISTEN;
+                }
+                break;
+                
+            case STATE_PREPARE_TO_LISTEN:
+                remoteDeviceID = 0;
                 idle();
                 DWM_Enable_Rx();
-                state = STATE_ANCHOR_LISTENING;
-                LCD_Position(1,6);
-                LCD_PrintNumber(successPercent);
+                state = STATE_LISTENING;
+                break;
 
-            break;
+            case STATE_LISTENING:    
 
-            case STATE_ANCHOR_LISTENING :
-                if(inter){ interrupt_routine(); }
+                if (cycleTimeoutFlag){
+                    cycleTimeoutFlag = 0u;
+                    state = STATE_INITIATE_CONTACT;
+                }
+                
+                if (interruptFlag){ interrupt_routine(); }
+
                 if (RxError){
                     RxError = 0;
                     DWM_Reset_Rx();
-                    state = STATE_INIT;
+                    state = STATE_PREPARE_TO_LISTEN;
                 }
-                else if (RxOk){
+                if (RxOk){
                     RxOk = 0;
-                    DWM_ReceiveData(RxData); 	// Read Rx buffer
-                    DWM_ReadSPI_ext(RX_TIME,NO_SUB, t2_8,5);
-                    state = STATE_ANCHOR_SEND_ANSWER;
-
+                    struct Message_s msg = readRxData();
+                    if (msg.id == INITIAL_MSG){                        
+                        DWM_ReadSPI_ext(RX_TIME,NO_SUB, t2_8,5);
+                        remoteDeviceID = msg.from;
+                        responseTime = (rand() % (50u - 1u)) + 1u;/// @TODO
+                        //responseTime = 1u;
+                        state = STATE_WAIT_RANDOM;
+                    }
+                    else if(msg.id == ANSWER_MSG && messageTimeout > 0u && msg.to == deviceID){
+                        DWM_ReadSPI_ext(RX_TIME,NO_SUB, t4_8,5);
+                        remoteDeviceID = msg.from;
+                        state = STATE_SEND_FINAL;
+                    }else{
+                        state = STATE_LISTENING; // @TODO Verif
+                    }
                 }
-            break;
 
-            case STATE_ANCHOR_SEND_ANSWER :
-                idle();
-                TxData[0] = 0xFA;
-                DWM_SendData(TxData, 1, 1);
-                state = STATE_ANCHOR_WAIT_ANSWER_COMPLETION;
-
+                break;
+            
+            case STATE_SEND_FINAL:
+                    sendTxData((struct Message_s) {
+                        .id = FINAL_MSG,
+                        .from = deviceID,
+                        .to = remoteDeviceID,
+                    }, MESSAGE_TIMEOUT);
+                    state = STATE_SEND_FINAL_PENDING;
+                break;
                 
-            break;
-                
-            case STATE_ANCHOR_WAIT_ANSWER_COMPLETION :
-                if(inter){ interrupt_routine(); }
+            case STATE_SEND_FINAL_PENDING:
+                if (messageTimeout == 0u){ state = STATE_PREPARE_TO_LISTEN; }  
+                if (interruptFlag){ interrupt_routine(); }
                 if (TxOk){
                     TxOk = 0;
-                    DWM_ReadSPI_ext(TX_TIME, NO_SUB, t3_8, 5);
+                    DWM_ReadSPI_ext(TX_TIME, NO_SUB, t5_8, 5);
                     idle();
                     DWM_Enable_Rx();
-                    state = STATE_ANCHOR_WAIT_FINAL;
-
+                    state = STATE_WAIT_FOR_RESULTS;
+                    messageTimeout = MESSAGE_TIMEOUT;
                 }
-            break;
-                
-            case STATE_ANCHOR_WAIT_FINAL :
-                if(inter){ interrupt_routine(); }
+                break;
+
+            case STATE_WAIT_FOR_RESULTS:
+                if (interruptFlag){ interrupt_routine(); }
+                if (messageTimeout == 0u){ state = STATE_PREPARE_TO_LISTEN; }  
                 if (RxError){
                     RxError = 0;
+                    state = STATE_PREPARE_TO_LISTEN;  
                     DWM_Reset_Rx();
-                    state = STATE_INIT;
                 }
-                else if (RxOk){
-                    RxOk = 0;
+                if (RxOk){
                     DWM_ReceiveData(RxData);
-                    DWM_ReadSPI_ext(RX_TIME,NO_SUB, t6_8,5);
-                    state = STATE_ANCHOR_SEND_TIMES;
-
-                }
-            break;
-                
-            case STATE_ANCHOR_SEND_TIMES :
-                idle();
-				for (int i=0;i<5;i++){
-					TxData[i] = t2_8[i];
-					TxData[i+5] = t3_8[i];
-					TxData[i+10] = t6_8[i];
-				}
-                DWM_SendData(TxData, 15, 1);
-                state = STATE_ANCHOR_END;
-
-                
-            break;
-                
-            case STATE_ANCHOR_END :
-                if(inter){ interrupt_routine(); }
-                if (TxOk){
-                    TxOk = 0;
-                    /*LED1_Write(LIGHT_ON);
-                    LED2_Write(LIGHT_ON);
-                    LED3_Write(LIGHT_ON);
-                    LED4_Write(LIGHT_ON);*/
-                    LED4_Write(~LED4_Read());
-                    idle();
-                    DWM_Enable_Rx();
-                    state = STATE_INIT;
-                    succesRate--;
-
-                    /*
-                    for(;;){
-                        for (uint8 i = 0u; i < 5u; i++){
-                            LED1_Write(i == 0u ? 0u : 1u);
-                            LED2_Write(i == 1u ? 0u : 1u);
-                            LED3_Write(i == 2u ? 0u : 1u);
-                            LED4_Write(i == 3u ? 0u : 1u);
-                            CyDelay(75u);
+                    /* Results messages are identified with their length instead,
+                       of their ID because there isn't enough space left is the
+                       data field for an ID */
+                    uint8_t len;
+                	DWM_ReadSPI_ext(RX_FINFO, NO_SUB, &len, 1);
+                    if (len == DATA_LEN + 2){
+                        // @TODO make a struct for that 1
+                        for (int i=0;i<5;i++){
+                            t2_8[i] = RxData[i];
+                            t3_8[i] = RxData[i+5];
+                            t6_8[i] = RxData[i+10];
                         }
-                        CyDelay(500u);   
+
+                        t1 = t2 = t3 = t4 = t5 = t6 = 0;
+                        for (int i=0;i<5;i++){
+                            t1 = (t1 << 8) | t1_8[4-i];
+                            t2 = (t2 << 8) | t2_8[4-i];
+                            t3 = (t3 << 8) | t3_8[4-i];
+                            t4 = (t4 << 8) | t4_8[4-i];
+                            t5 = (t5 << 8) | t5_8[4-i];
+                            t6 = (t6 << 8) | t6_8[4-i];
+                        }
+                        if (t6 < t2 || t5 < t1){
+                            state = STATE_PREPARE_TO_LISTEN;  
+                        }
+                        else{
+                            state = STATE_PROCESS_RESULTS;
+                            RxOk = 0; // @TODO should it be higher ?
+                        }   
+                    }else{
+                        state = STATE_PREPARE_TO_LISTEN;
                     }
-                    */
                 }
-            break;
-                
-            default:
-            break;
-        }
-    }
-}
+                break;
 
-void tagLoop(){
-    LCD_Position(0u, 0u);
-    LCD_PrintString("tag     ");
-
-    
-    
-    for(;;){
-        switch(state){
-            case STATE_INIT :
-//                SW3_prev = SW3_cur;
-//                SW3_cur = SW3_Read();
-                LCD_Position(1,6);
-                LCD_PrintNumber(successPercent);
-
-                if (1)
-                //if (SW3_cur && !(SW3_prev))
-                {
-//                    CyDelay(50u);
-//                    LCD_Position(5u, 0u);
-//                    LCD_PrintString("sent");
-                    idle();
-                    TxData[0] = 0xFA;
-                    DWM_SendData(TxData,1,1);
-                    state = STATE_TAG_WAIT_FIRST_SEND;
-
-                }
-            break;
-                
-    		case STATE_TAG_WAIT_FIRST_SEND :
-                if(inter){ interrupt_routine(); }
-                if (TxOk){
-                    TxOk = 0;
-                    DWM_ReadSPI_ext(TX_TIME, NO_SUB, t1_8, 5);//get tx time (T1)
-                    idle();
-                    DWM_Enable_Rx();
-                    state = STATE_TAG_WAIT_RESPONSE;
-
-                    
-                }
-            break;
-                
-    		case STATE_TAG_WAIT_RESPONSE :
-                if(inter){ 
-                    //CyDelay(10u);
-                    interrupt_routine(); 
-                }
-                if (RxError){
-                    RxError = 0;
-                    DWM_Reset_Rx();
-                    state = STATE_INIT;
-
-                }
-                else if (RxOk){
-                    RxOk = 0;
-                    DWM_ReceiveData(RxData); 	// Read Rx buffer
-                    DWM_ReadSPI_ext(RX_TIME,NO_SUB, t4_8,5);// get T4
-                    state = STATE_TAG_SECOND_SEND;
-
-                }
-            break;
-                
-    		case STATE_TAG_SECOND_SEND :
-                //idle();
-                DWM_SendData(TxData, 1, 1);
-                state = STATE_TAG_WAIT_SECOND_SEND;
-
-            break;
-                
-    		case STATE_TAG_WAIT_SECOND_SEND :
-                if(inter){ interrupt_routine(); }
-                if (TxOk){
-                    TxOk = 0;
-                    DWM_ReadSPI_ext(TX_TIME, NO_SUB, t5_8, 5);	//get tx time (T5)
-                    idle();
-                    DWM_Enable_Rx();
-                    state = STATE_TAG_GET_TIMES;
-
-                    
-                }
-            break;
-                
-    		case STATE_TAG_GET_TIMES :
-                if(inter){ interrupt_routine(); }
-                if (RxError){
-                    RxError = 0;
-                    state = STATE_INIT;
-
-                    DWM_Reset_Rx();
-                }
-                else if (RxOk){
-                    DWM_ReceiveData(RxData);	//Read Rx Buffer
-                    for (int i=0;i<5;i++){
-                        t2_8[i] = RxData[i];
-                        t3_8[i] = RxData[i+5];
-                        t6_8[i] = RxData[i+10];
-                    }
-
-                    // Cast all times to uint64
-                    t1 = t2 = t3 = t4 = t5 = t6 = 0;
-                    for (int i=0;i<5;i++){
-                        t1 = (t1 << 8) | t1_8[4-i];
-                        t2 = (t2 << 8) | t2_8[4-i];
-                        t3 = (t3 << 8) | t3_8[4-i];
-                        t4 = (t4 << 8) | t4_8[4-i];
-                        t5 = (t5 << 8) | t5_8[4-i];
-                        t6 = (t6 << 8) | t6_8[4-i];
-                    }
-                    if (t6 < t2 || t5 < t1){
-                        state = STATE_INIT;
-
-                    }
-                    else{
-                        state = STATE_TAG_PROCESS_DISTANCE;
-
-                        RxOk = 0;
-                    }
-                    //LED4_Write(1);
-                }
-            break;
-                
-    		case STATE_TAG_PROCESS_DISTANCE :
-                succesRate--;
-                LED3_Write(~LED3_Read());
+            case STATE_PROCESS_RESULTS:
 
                 TroundMaster = (t4-t1);
                 TreplySlave = (t3-t2);
                 TroundSlave = (t6-t3);
                 TreplyMaster = (t5-t4);
                 
-                
                 tof_num = TroundMaster * TroundSlave - TreplyMaster * TreplySlave;
                 tof_denum = TroundMaster + TroundSlave + TreplySlave + TroundMaster;
+                tof_tick = tof_num /tof_denum; 
                 
-                timeOfFly_tick = tof_num /tof_denum; 
-                distance = LIGHT_SPEED * timeOfFly_tick * TICK2S; 
+                distance = LIGHT_SPEED * tof_tick * TICK2S; 
 
-                if (distance > 0.0 && distance < 100.0)
-                {
-
-                    distLog[distIdx] = distance;
-                    distIdx += 1;
-                    if(distIdx >= MEAN_LEN){
-                        distIdx = 0;
-                        LED4_Write(~LED4_Read());
+                if (distance > 0.0 && distance < 100.0){
                         
-                        mean = 0.0;
-                        for (uint8_t i = 0; i < MEAN_LEN; i++){
-                            mean += distLog[i];
-                            //distLog[i] = 0;
+                        if ((uint) (distance * 100.0) < SAFE_DISTANCE_CM){
+                            alertOn = 1;
                         }
-                        mean = mean / MEAN_LEN;
                         
                         char str[8];
-                        sprintf(str, "%d cm", (int) (mean * 100));
+                        sprintf(str, "%d cm", (uint) (distance * 100.0));
                         LCD_ClearDisplay();
                         LCD_Position(0,0);
                         LCD_PrintString(str);
-                        
-                    }                    
+                    //}                    
                 }
-                
-                state = STATE_TAG_END;
-
-                
-            break;
+                state = STATE_SEND_DISTANCE;                         
+                break;
             
-            case STATE_TAG_END :
-                CyDelay(1u);
-            break;
+            case STATE_SEND_DISTANCE:
+                sendTxData((struct Message_s) {
+                    .id = DISTANCE_MSG,
+                    .from = deviceID,
+                    .to = remoteDeviceID,
+                    .data = (int) (distance * 100),
+                }, MESSAGE_TIMEOUT);
+                
+                state = STATE_SEND_DISTANCE_PENDING;
+                break;
+                
+            case STATE_SEND_DISTANCE_PENDING:
+                if (messageTimeout == 0u){ state = STATE_PREPARE_TO_LISTEN; }  
+                if (interruptFlag){ interrupt_routine(); }
+                if (TxOk){
+                    TxOk = 0;
+                    state = STATE_PREPARE_TO_LISTEN;
+                }
+                break;
+            
+            case STATE_WAIT_RANDOM:
 
+                if (interruptFlag){ interrupt_routine(); }
+
+                if (RxError){
+                    RxError = 0;
+                    DWM_Reset_Rx();
+                    state = STATE_PREPARE_TO_LISTEN;
+                }
+                if (RxOk){
+                    RxOk = 0;
+                    struct Message_s msg = readRxData();
+                    if(msg.id == ANSWER_MSG && msg.to == remoteDeviceID){
+                        state = STATE_PREPARE_TO_LISTEN;
+                    }else if(msg.id == ANSWER_MSG && msg.to == deviceID){
+                        DWM_ReadSPI_ext(RX_TIME,NO_SUB, t4_8,5);
+                        remoteDeviceID = msg.from;
+                        state = STATE_SEND_FINAL;
+                    }
+                }
+                if (responseTime == 0u && remoteDeviceID != 0u){
+                     state = STATE_ANSWER;
+                }
+
+                break;
+                
+            case STATE_ANSWER:
+                idle();
+                sendTxData((struct Message_s) {
+                    .id = ANSWER_MSG,
+                    .from = deviceID,
+                    .to = remoteDeviceID,
+                }, MESSAGE_TIMEOUT);
+                state = STATE_ANSWER_PENDING;
+                break;
+            
+            case STATE_ANSWER_PENDING:
+                if (messageTimeout == 0u){ state = STATE_PREPARE_TO_LISTEN; } 
+                if (interruptFlag){ interrupt_routine(); }
+                if (TxOk){
+                    TxOk = 0;
+                    DWM_ReadSPI_ext(TX_TIME, NO_SUB, t3_8, 5);
+                    idle();
+                    DWM_Enable_Rx();
+                    state = STATE_WAIT_FOR_FINAL;
+                    messageTimeout = MESSAGE_TIMEOUT;
+                }
+                break;
+
+            case STATE_WAIT_FOR_FINAL:
+                if (messageTimeout == 0u){ state = STATE_PREPARE_TO_LISTEN; } 
+                if (interruptFlag){ interrupt_routine(); }
+                if (RxError){
+                    RxError = 0;
+                    DWM_Reset_Rx();
+                    state = STATE_PREPARE_TO_LISTEN; 
+                }
+                else if (RxOk){
+                    RxOk = 0;
+                    struct Message_s msg = readRxData();
+                    if (msg.id == FINAL_MSG && msg.to == deviceID && msg.from == remoteDeviceID){
+                        DWM_ReadSPI_ext(RX_TIME,NO_SUB, t6_8,5);
+                        state = STATE_SEND_RESULTS;
+                    }
+                    else{
+                        state = STATE_PREPARE_TO_LISTEN; 
+                    }
+                }
+                break;
+
+                case STATE_SEND_RESULTS:
+                    idle();
+                    // @TODO make a struct for that 2
+                    for (int i=0;i<5;i++){
+                        TxData[i] = t2_8[i];
+                        TxData[i+5] = t3_8[i];
+                        TxData[i+10] = t6_8[i];
+                    }
+                    DWM_SendData(TxData, DATA_LEN, 1);
+                    state = STATE_SEND_RESULTS_PENDING;
+                    messageTimeout = MESSAGE_TIMEOUT;
+                    break;
+                
+                case STATE_SEND_RESULTS_PENDING:
+                    if (messageTimeout == 0u){ state = STATE_PREPARE_TO_LISTEN; }
+                    if (interruptFlag){ interrupt_routine(); }
+                    if (TxOk){
+                        TxOk = 0;
+                        state = STATE_WAIT_FOR_DISTANCE;
+                        messageTimeout = MESSAGE_TIMEOUT * 3; // @TODO Fix me
+                    }
+                    break;
+                
+                case STATE_WAIT_FOR_DISTANCE:
+                    if (messageTimeout == 0u){
+                        state = STATE_PREPARE_TO_LISTEN;
+                    } 
+                    if (interruptFlag){ interrupt_routine(); }
+                    if (RxError){
+                        RxError = 0;
+                        DWM_Reset_Rx();
+                        state = STATE_PREPARE_TO_LISTEN; 
+                    }
+                    else if (RxOk){
+                        RxOk = 0;
+
+                        struct Message_s msg = readRxData();
+                        if (msg.id == DISTANCE_MSG && msg.to == deviceID && msg.from == remoteDeviceID){
+                            if ((uint) msg.data < SAFE_DISTANCE_CM){
+                                alertOn = 1;
+                            }
+                            
+                            char str[8];
+                            sprintf(str, "%d cm", msg.data);
+                            LCD_ClearDisplay();
+                            LCD_Position(0,0);
+                            LCD_PrintString(str);
+                            
+                            state = STATE_PREPARE_TO_LISTEN;
+                        }
+                        else{
+                            state = STATE_PREPARE_TO_LISTEN; 
+                        }
+                    }
+                    break;
+                
             default:
-            break;
+                break;
         }
     }
+
 }
-
-
 
 /* [] END OF FILE */
