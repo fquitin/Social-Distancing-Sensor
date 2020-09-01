@@ -94,6 +94,7 @@ uint16 alertTimer = 0u;
 #define MESSAGE_TIMEOUT (5u)
 
 #define SAFE_DISTANCE_CM (100u)
+#define SAFE_DISTANCE_STEP_CM (15u)
 
 #define TICK2S ((1.0f / (128 * 499.2f * 10e6)) * 10.0f) // Unknown factor 10 
 #define LIGHT_SPEED (299792458.0f) // m/s
@@ -118,12 +119,12 @@ CY_ISR( isr_timeout_Handler ){
     }
     
     if (alertOn){
-        alertOn = 0;
-        LED1_Write(LIGHT_ON);
-        LED2_Write(LIGHT_ON);
-        LED3_Write(LIGHT_ON);
-        LED4_Write(LIGHT_ON);
+        LED1_Write(alertOn >= 1u);
+        LED2_Write(alertOn >= 2u);
+        LED3_Write(alertOn >= 3u);
+        LED4_Write(alertOn >= 4u);
         alertTimer = ALERT_PERIOD;
+        alertOn = 0;
     }
     
     if (alertTimer == 1u){
@@ -398,8 +399,17 @@ void socialDistancindLoop(){
 
                 if (distance > 0.0 && distance < 100.0){
                         
-                        if ((uint) (distance * 100.0) < SAFE_DISTANCE_CM){
+                        if ((uint) (distance * 100.0) < SAFE_DISTANCE_CM + SAFE_DISTANCE_STEP_CM * 3){
                             alertOn = 1;
+                        }
+                        if ((uint) (distance * 100.0) < SAFE_DISTANCE_CM + SAFE_DISTANCE_STEP_CM * 2){
+                            alertOn = 2;
+                        }
+                        if ((uint) (distance * 100.0) < SAFE_DISTANCE_CM + SAFE_DISTANCE_STEP_CM){
+                            alertOn = 3;
+                        }
+                        if ((uint) (distance * 100.0) < SAFE_DISTANCE_CM){
+                            alertOn = 4;
                         }
                         
                         char str[8];
@@ -540,8 +550,18 @@ void socialDistancindLoop(){
 
                         struct Message_s msg = readRxData();
                         if (msg.id == DISTANCE_MSG && msg.to == deviceID && msg.from == remoteDeviceID){
-                            if ((uint) msg.data < SAFE_DISTANCE_CM){
+                            
+                            if ((uint) msg.data < SAFE_DISTANCE_CM + SAFE_DISTANCE_STEP_CM * 3){
                                 alertOn = 1;
+                            }
+                            if ((uint) msg.data < SAFE_DISTANCE_CM + SAFE_DISTANCE_STEP_CM * 2){
+                                alertOn = 2;
+                            }
+                            if ((uint) msg.data < SAFE_DISTANCE_CM + SAFE_DISTANCE_STEP_CM){
+                                alertOn = 3;
+                            }
+                            if ((uint) msg.data < SAFE_DISTANCE_CM){
+                                alertOn = 4;
                             }
                             
                             char str[8];
